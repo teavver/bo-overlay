@@ -129,10 +129,12 @@ fn parse_keybind(s: &str) -> Result<(ModMask, u32), String> {
             "f4"  => 0xffc1, "f5"  => 0xffc2, "f6"  => 0xffc3,
             "f7"  => 0xffc4, "f8"  => 0xffc5, "f9"  => 0xffc6,
             "f10" => 0xffc7, "f11" => 0xffc8, "f12" => 0xffc9,
-            "space"           => 0x0020,
-            "return" | "enter"=> 0xff0d,
-            "tab"             => 0xff09,
-            "escape" | "esc"  => 0xff1b,
+            "space"                    => 0x0020,
+            "return" | "enter"         => 0xff0d,
+            "tab"                      => 0xff09,
+            "escape" | "esc"           => 0xff1b,
+            "shift_r" | "rightshift"   => 0xffe2,
+            "shift_l" | "leftshift"    => 0xffe1,
             other => return Err(format!("unknown key: {other}")),
         }
     };
@@ -238,17 +240,21 @@ fn run(
         .ok_or("No 32-bit ARGB visual found. Is a compositor running?")?;
 
     let (text_w, text_h) = measure_text(content, font_px, &cfg.font_family);
-    let bar_h = (font_px as i32 + 20) as u32; // PAD*2 = 10*2
-    let nat_w = (text_w + 20) as u32;
-    let content_h = (text_h + 20) as u32;
+    let bar_h  = (font_px as i32 + 20) as u32; // PAD*2 = 10*2
+    let nat_w  = (text_w + 20) as u32;
+    let full_h = (text_h + 20) as u32 + bar_h;
 
     let colormap = conn.generate_id()?;
     conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual_id)?;
 
-    let win = conn.generate_id()?;
+    // -----------------------------------------------------------------------
+    // Normal window — WM-managed (borders, moveable, closeable via WM).
+    // override_redirect is NOT set so i3 fully manages this window.
+    // -----------------------------------------------------------------------
+    let win_normal = conn.generate_id()?;
     conn.create_window(
-        32, win, root, 50, 50,
-        nat_w as u16, (content_h + bar_h) as u16,
+        32, win_normal, root, 50, 50,
+        nat_w as u16, full_h as u16,
         0, WindowClass::INPUT_OUTPUT, visual_id,
         &CreateWindowAux::new()
             .background_pixel(0)
@@ -269,22 +275,49 @@ fn run(
     let a_splash    = intern_atom(&conn, b"_NET_WM_WINDOW_TYPE_SPLASH")?;
     let a_motif     = intern_atom(&conn, b"_MOTIF_WM_HINTS")?;
 
-    conn.change_property32(PropMode::REPLACE, win, a_wm_proto, AtomEnum::ATOM, &[a_wm_del])?;
-    conn.change_property32(PropMode::REPLACE, win, a_state, AtomEnum::ATOM,
+    conn.change_property32(PropMode::REPLACE, win_normal, a_wm_proto, AtomEnum::ATOM, &[a_wm_del])?;
+    conn.change_property32(PropMode::REPLACE, win_normal, a_state, AtomEnum::ATOM,
         &[a_above, a_skip_bar, a_skip_pager])?;
-    conn.change_property32(PropMode::REPLACE, win, a_wm_type, AtomEnum::ATOM, &[a_splash])?;
-    conn.change_property32(PropMode::REPLACE, win, a_motif, a_motif, &[2u32, 0, 0, 0, 0])?;
-    conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, b"bo-overlay")?;
+    conn.change_property32(PropMode::REPLACE, win_normal, a_wm_type, AtomEnum::ATOM, &[a_splash])?;
+    conn.change_property32(PropMode::REPLACE, win_normal, a_motif, a_motif, &[2u32, 0, 0, 0, 0])?;
+    conn.change_property8(PropMode::REPLACE, win_normal, AtomEnum::WM_NAME, AtomEnum::STRING, b"bo-overlay")?;
+    set_click_through(&conn, win_normal, false)?;
 
-    conn.map_window(win)?;
-    conn.flush()?;
+    // -----------------------------------------------------------------------
+    // Overlay window — override_redirect at creation, NEVER changed.
+    // The WM never sees this window: no border, always above everything.
+    // Always click-through (empty input shape), set once at creation.
+    //
+    // Mapped off-screen at startup (-10000, 0) and NEVER unmapped.
+    // Moving it on/off-screen avoids the compositor "first-map garbage
+    // texture" artifact that occurs when mapping a previously-unmapped window.
+    // -----------------------------------------------------------------------
+    let win_overlay = conn.generate_id()?;
+    conn.create_window(
+        32, win_overlay, root, 50, 50,
+        nat_w as u16, full_h as u16,
+        0, WindowClass::INPUT_OUTPUT, visual_id,
+        &CreateWindowAux::new()
+            .background_pixel(0)
+            .border_pixel(0)
+            .colormap(colormap)
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE),
+    )?;
+    set_click_through(&conn, win_overlay, true)?;
 
+    // -----------------------------------------------------------------------
+    // Cairo surfaces — one per window.
+    // -----------------------------------------------------------------------
     let cairo_conn = unsafe { CairoConn::from_raw_none(conn.as_raw_xcb_connection() as *mut _) };
     let cairo_visual = unsafe {
         XCBVisualType::from_raw_none(&raw_visual as *const RawVisualType as *mut _)
     };
-    let surface = XCBSurface::create(
-        &cairo_conn, &XCBDrawable(win), &cairo_visual, nat_w as i32, (content_h + bar_h) as i32,
+    let surf_normal = XCBSurface::create(
+        &cairo_conn, &XCBDrawable(win_normal), &cairo_visual, nat_w as i32, full_h as i32,
+    )?;
+    let surf_overlay = XCBSurface::create(
+        &cairo_conn, &XCBDrawable(win_overlay), &cairo_visual, nat_w as i32, full_h as i32,
     )?;
 
     let kc = keycode_for_sym(&conn, keysym)
@@ -293,26 +326,37 @@ fn run(
 
     let mut overlay = false;
     let mut hovered = false;
-    let mut cur_w   = nat_w;
-    let mut cur_h   = content_h + bar_h;
+    let mut norm_w  = nat_w;
+    let mut norm_h  = full_h;
 
-    set_click_through(&conn, win, false)?;
-    draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+    // Map win_overlay on-screen (at the same starting position as win_normal)
+    // so the compositor (picom) immediately establishes its redirect/texture.
+    // Off-screen windows are often skipped by compositors, leaving a garbage
+    // texture that appears as a frozen screenshot when the window is shown.
+    // In normal mode win_overlay stays transparent so it is visually invisible.
+    draw_clear(&surf_overlay);
+    conn.map_window(win_overlay)?;
+    conn.flush()?;
+
+    // Start in normal mode.
+    draw(&surf_normal, content, filename, norm_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
          false, bar_h, false, color_idle, color_hover);
+    conn.map_window(win_normal)?;
     conn.flush()?;
 
     loop {
         conn.flush()?;
 
+        // Hover detection polls the overlay window position.
         if overlay {
-            let ptr = conn.query_pointer(win)?.reply()?;
+            let ptr = conn.query_pointer(win_overlay)?.reply()?;
             let over = ptr.win_x >= 0 && ptr.win_y >= 0
-                && (ptr.win_x as u32) < cur_w
-                && (ptr.win_y as u32) < cur_h;
+                && (ptr.win_x as u32) < nat_w
+                && (ptr.win_y as u32) < full_h;
             if over != hovered {
                 hovered = over;
-                draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
-                     overlay, bar_h, hovered, color_idle, color_hover);
+                draw(&surf_overlay, content, filename, nat_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                     true, bar_h, hovered, color_idle, color_hover);
                 conn.flush()?;
             }
         }
@@ -321,28 +365,54 @@ fn run(
             None => { thread::sleep(Duration::from_millis(16)); continue; }
             Some(event) => match event {
                 Event::Expose(e) if e.count == 0 => {
-                    draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
-                         overlay, bar_h, hovered, color_idle, color_hover);
+                    if e.window == win_normal {
+                        draw(&surf_normal, content, filename, norm_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                             false, bar_h, false, color_idle, color_hover);
+                    } else if e.window == win_overlay {
+                        if overlay {
+                            draw(&surf_overlay, content, filename, nat_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                                 true, bar_h, hovered, color_idle, color_hover);
+                        } else {
+                            draw_clear(&surf_overlay);
+                        }
+                    }
                 }
                 Event::KeyPress(e) if e.detail == kc => {
                     overlay = !overlay;
                     hovered = false;
-                    set_click_through(&conn, win, overlay)?;
-                    // No configure_window — window size is never changed by the app.
-                    draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
-                         overlay, bar_h, hovered, color_idle, color_hover);
+                    if overlay {
+                        // Snap win_overlay onto where win_normal sits, then hide win_normal.
+                        // win_overlay is moved (not mapped) to avoid compositor artifacts.
+                        let t = conn.translate_coordinates(win_normal, root, 0, 0)?.reply()?;
+                        draw(&surf_overlay, content, filename, nat_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                             true, bar_h, false, color_idle, color_hover);
+                        conn.configure_window(win_overlay,
+                            &ConfigureWindowAux::new().x(t.dst_x as i32).y(t.dst_y as i32))?;
+                        conn.unmap_window(win_normal)?;
+                    } else {
+                        // Restore win_normal at win_overlay's current position.
+                        // Clear win_overlay to transparent so it is invisible in normal mode
+                        // while remaining mapped (keeping the compositor redirect live).
+                        let t = conn.translate_coordinates(win_overlay, root, 0, 0)?.reply()?;
+                        draw_clear(&surf_overlay);
+                        draw(&surf_normal, content, filename, norm_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                             false, bar_h, false, color_idle, color_hover);
+                        conn.configure_window(win_normal,
+                            &ConfigureWindowAux::new().x(t.dst_x as i32).y(t.dst_y as i32))?;
+                        conn.map_window(win_normal)?;
+                    }
                     conn.flush()?;
                     let _ = e.time;
                 }
-                Event::ConfigureNotify(e) if e.window == win => {
+                Event::ConfigureNotify(e) if e.window == win_normal => {
                     let nw = e.width as u32;
                     let nh = e.height as u32;
-                    if nw != cur_w || nh != cur_h {
-                        cur_w = nw;
-                        cur_h = nh;
-                        surface.set_size(nw as i32, nh as i32)?;
-                        draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
-                             overlay, bar_h, hovered, color_idle, color_hover);
+                    if nw != norm_w || nh != norm_h {
+                        norm_w = nw;
+                        norm_h = nh;
+                        surf_normal.set_size(nw as i32, nh as i32)?;
+                        draw(&surf_normal, content, filename, norm_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                             false, bar_h, false, color_idle, color_hover);
                     }
                 }
                 Event::ClientMessage(e) if e.data.as_data32()[0] == a_wm_del => break,
@@ -422,6 +492,14 @@ fn measure_text(content: &str, font_px: f64, family: &str) -> (i32, i32) {
     layout.pixel_size()
 }
 
+fn draw_clear(surface: &XCBSurface) {
+    let cr = match cairo::Context::new(surface) { Ok(c) => c, Err(_) => return };
+    cr.set_operator(cairo::Operator::Source);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    let _ = cr.paint();
+    surface.flush();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw(
     surface: &XCBSurface,
@@ -442,7 +520,15 @@ fn draw(
     const PAD: f64 = 10.0;
 
     cr.set_operator(cairo::Operator::Source);
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    if overlay {
+        // Transparent clear: compositor shows windows below through alpha.
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    } else {
+        // Solid dark background: normal window must be opaque so the
+        // compositor does not bleed whatever is behind it through the
+        // content area.
+        cr.set_source_rgba(0.08, 0.08, 0.08, 1.0);
+    }
     let _ = cr.paint();
 
     if !overlay {
@@ -485,4 +571,100 @@ fn draw(
     pangocairo::functions::show_layout(&cr, &layout);
 
     surface.flush();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_color ---
+
+    #[test]
+    fn color_hex8() {
+        let c = parse_color("#FF8040BF").unwrap();
+        assert!((c.0 - 1.0).abs() < 1e-6);
+        assert!((c.1 - 128.0/255.0).abs() < 1e-4);
+        assert!((c.2 - 64.0/255.0).abs() < 1e-4);
+        assert!((c.3 - 191.0/255.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn color_hex6_alpha_is_one() {
+        let (_, _, _, a) = parse_color("#FF0000").unwrap();
+        assert!((a - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn color_rgba_function() {
+        let c = parse_color("rgba(255, 0, 128, 0.5)").unwrap();
+        assert!((c.0 - 1.0).abs() < 1e-6);
+        assert!((c.1 - 0.0).abs() < 1e-6);
+        assert!((c.2 - 128.0/255.0).abs() < 1e-4);
+        assert!((c.3 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn color_rgb_function_alpha_is_one() {
+        let (_, _, _, a) = parse_color("rgb(10, 20, 30)").unwrap();
+        assert!((a - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn color_invalid_returns_none() {
+        assert!(parse_color("not-a-color").is_none());
+        assert!(parse_color("#FFFFF").is_none());       // 5 hex digits
+        assert!(parse_color("rgba(1,2,3)").is_none()); // missing alpha
+    }
+
+    #[test]
+    fn color_whitespace_trimmed() {
+        assert!(parse_color("  #FF0000  ").is_some());
+    }
+
+    // --- parse_keybind ---
+
+    #[test]
+    fn keybind_single_letter() {
+        let (mask, sym) = parse_keybind("ctrl-t").unwrap();
+        assert!(mask.contains(ModMask::CONTROL));
+        assert_eq!(sym, b't' as u32);
+    }
+
+    #[test]
+    fn keybind_multi_modifier() {
+        let (mask, sym) = parse_keybind("ctrl-shift-f1").unwrap();
+        assert!(mask.contains(ModMask::CONTROL));
+        assert!(mask.contains(ModMask::SHIFT));
+        assert_eq!(sym, 0xffbe);
+    }
+
+    #[test]
+    fn keybind_alt() {
+        let (mask, _) = parse_keybind("alt-f").unwrap();
+        assert!(mask.contains(ModMask::M1));
+    }
+
+    #[test]
+    fn keybind_function_keys() {
+        for (name, expected) in [
+            ("f1", 0xffbe_u32), ("f6", 0xffc3), ("f12", 0xffc9),
+        ] {
+            let (_, sym) = parse_keybind(&format!("ctrl-{name}")).unwrap();
+            assert_eq!(sym, expected, "failed for {name}");
+        }
+    }
+
+    #[test]
+    fn keybind_unknown_modifier_errors() {
+        assert!(parse_keybind("win-t").is_err());
+    }
+
+    #[test]
+    fn keybind_unknown_key_errors() {
+        assert!(parse_keybind("ctrl-home").is_err());
+    }
 }

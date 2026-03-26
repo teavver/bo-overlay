@@ -16,7 +16,7 @@ wrap = true
 # Supported modifiers : ctrl, shift, alt, super
 # Supported keys      : any single character, or f1-f12, space, return, tab, escape
 # Examples: "ctrl-t", "ctrl-shift-o", "alt-f2"
-keybind = "ctrl-t"
+keybind = "ctrl-rightshift"
 
 # Text color in overlay mode when the mouse is NOT over the window.
 # Accepted formats:
