@@ -1,15 +1,15 @@
 # Font size in pixels.
 # Default: 1.5% of screen height (~16px on 1080p). Set to any positive number to override.
-font_size = 50
+font_size = 16
 
 # Font family — any name recognised by fontconfig.
 # Common values: "Monospace", "Sans", "DejaVu Sans Mono", "JetBrains Mono", "Noto Mono"
-font_family = "JetBrains Mono"
+font_family = "Monospace"
 
 # Wrap text when the window is resized narrower than the content.
 # true  — text reflows to fit the window
 # false — text is clipped at the window edge (no reflow)
-wrap = false
+wrap = true
 
 # Key binding to toggle between normal (active) and overlay (click-through) mode.
 # Format: modifiers and key joined by "-", case-insensitive.
@@ -24,8 +24,8 @@ keybind = "ctrl-t"
 #   "#RRGGBB"            — hex, fully opaque,        e.g. "#FFFFFF"
 #   "rgba(r, g, b, a)"   — r/g/b 0-255, a 0.0-1.0,  e.g. "rgba(255, 255, 255, 0.75)"
 #   "rgb(r, g, b)"       — r/g/b 0-255, fully opaque
-color_idle = "rgba(255, 255, 255, 0.75)"
+color_idle = "rgba(255, 255, 255, 0.65)"
 
 # Text color in overlay mode when the mouse IS hovering over the window.
 # Same accepted formats as color_idle.
-color_hover = "rgba(255, 255, 255, 0.25)"
+color_hover = "rgba(255, 255, 255, 0.15)"

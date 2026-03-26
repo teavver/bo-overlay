@@ -179,13 +179,18 @@ fn main() {
         process::exit(1);
     }
 
-    let content = match fs::read_to_string(positional[0]) {
+    let file_path = positional[0];
+    let content = match fs::read_to_string(file_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading '{}': {}", positional[0], e);
+            eprintln!("Error reading '{}': {}", file_path, e);
             process::exit(1);
         }
     };
+    let filename = PathBuf::from(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_string());
 
     let config_path = config_path.unwrap_or_else(|| {
         PathBuf::from(env::var("HOME").unwrap_or_default()).join(".bo-config.toml")
@@ -207,7 +212,7 @@ fn main() {
         (1.0, 1.0, 1.0, 0.25)
     });
 
-    if let Err(e) = run(&content, &cfg, mod_mask, keysym, color_idle, color_hover) {
+    if let Err(e) = run(&content, &filename, &cfg, mod_mask, keysym, color_idle, color_hover) {
         eprintln!("Fatal: {e}");
         process::exit(1);
     }
@@ -215,6 +220,7 @@ fn main() {
 
 fn run(
     content: &str,
+    filename: &str,
     cfg: &Config,
     mod_mask: ModMask,
     keysym: u32,
@@ -287,12 +293,11 @@ fn run(
 
     let mut overlay = false;
     let mut hovered = false;
-    let mut base_h  = content_h;
     let mut cur_w   = nat_w;
     let mut cur_h   = content_h + bar_h;
 
     set_click_through(&conn, win, false)?;
-    draw(&surface, content, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+    draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
          false, bar_h, false, color_idle, color_hover);
     conn.flush()?;
 
@@ -306,7 +311,7 @@ fn run(
                 && (ptr.win_y as u32) < cur_h;
             if over != hovered {
                 hovered = over;
-                draw(&surface, content, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
                      overlay, bar_h, hovered, color_idle, color_hover);
                 conn.flush()?;
             }
@@ -316,16 +321,15 @@ fn run(
             None => { thread::sleep(Duration::from_millis(16)); continue; }
             Some(event) => match event {
                 Event::Expose(e) if e.count == 0 => {
-                    draw(&surface, content, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                    draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
                          overlay, bar_h, hovered, color_idle, color_hover);
                 }
                 Event::KeyPress(e) if e.detail == kc => {
                     overlay = !overlay;
                     hovered = false;
                     set_click_through(&conn, win, overlay)?;
-                    let new_h = if overlay { base_h } else { base_h + bar_h };
-                    conn.configure_window(win, &ConfigureWindowAux::new().height(new_h))?.check()?;
-                    draw(&surface, content, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                    // No configure_window — window size is never changed by the app.
+                    draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
                          overlay, bar_h, hovered, color_idle, color_hover);
                     conn.flush()?;
                     let _ = e.time;
@@ -336,9 +340,8 @@ fn run(
                     if nw != cur_w || nh != cur_h {
                         cur_w = nw;
                         cur_h = nh;
-                        base_h = if overlay { nh } else { nh.saturating_sub(bar_h).max(content_h) };
                         surface.set_size(nw as i32, nh as i32)?;
-                        draw(&surface, content, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
+                        draw(&surface, content, filename, cur_w, nat_w, font_px, &cfg.font_family, cfg.wrap,
                              overlay, bar_h, hovered, color_idle, color_hover);
                     }
                 }
@@ -423,6 +426,7 @@ fn measure_text(content: &str, font_px: f64, family: &str) -> (i32, i32) {
 fn draw(
     surface: &XCBSurface,
     content: &str,
+    filename: &str,
     win_w: u32,
     nat_w: u32,
     font_px: f64,
@@ -448,7 +452,7 @@ fn draw(
 
         let bl = pangocairo::functions::create_layout(&cr);
         bl.set_font_description(Some(&font_desc(font_px, family)));
-        bl.set_text("normal");
+        bl.set_text(&format!("normal ~ {filename}"));
         cr.set_source_rgb(1.0, 1.0, 1.0);
         let (_, lh) = bl.pixel_size();
         cr.move_to(PAD, (bar_h as f64 - lh as f64) / 2.0);
