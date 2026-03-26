@@ -9,6 +9,5 @@ cargo build --release
 ## Install
 
 ```bash
-mkdir -p ~/.local/bin
-ln -s "$(pwd)/target/release/bo" ~/.local/bin/overlay
+sudo ln -s "$(pwd)/target/release/bo" /usr/bin/overlay
 ```
