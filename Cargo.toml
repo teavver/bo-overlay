@@ -1,0 +1,11 @@
+[package]
+name = "bo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+x11rb = { version = "0.13", features = ["shape", "as-raw-xcb-connection", "dl-libxcb"] }
+as-raw-xcb-connection = "1"
+cairo-rs = { version = "0.19", features = ["xcb"] }
+pango = "0.19"
+pangocairo = "0.19"
